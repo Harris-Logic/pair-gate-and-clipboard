@@ -5,8 +5,9 @@
       1. 检查 Node.js（>=18）与本机 DSH 安装位置。
       2. 把 services/ scripts/ 复制到安装目录（默认 %LOCALAPPDATA%\pair-gate-and-clipboard）。
       3. 生成/更新 config\*.json：桌面文档与附件目录按当前用户自动推导，
-         口令沿用已有配置（首次**随机生成一个 8 位口令并打印出来**），
-         端口沿用已有配置（首次 18080/18082）。
+         端口沿用已有配置（首次 18080/18082）。口令沿用已有配置，首次安装时：
+           门(18080) —— 随机生成 8 位并打印出来；
+           剪贴板(18082) —— **留空**：服务进入"设置模式"，第一次访问时在页面上自己设。
       4. 打 DSH Web 鉴权补丁（scripts\dsh-web-auth-patch.ps1）——
          没有它，"换 IP / 重启后仍然免配对"不成立，详见 README。
       5. 加防火墙规则（TCP，LocalSubnet，Profile Any）。
@@ -218,7 +219,12 @@ $oldChat = Read-JsonFile -Path $chatConfigPath
 
 $gatePort = if ($GatePort -gt 0) { $GatePort } elseif ($oldGate -and $oldGate.port) { [int]$oldGate.port } else { 18080 }
 $chatPort = if ($ChatPort -gt 0) { $ChatPort } elseif ($oldChat -and $oldChat.port) { [int]$oldChat.port } else { 18082 }
-$pw = if ($Password -ne '') { $Password } elseif ($oldGate -and $oldGate.password) { [string]$oldGate.password } else { New-RandomPassword }
+# 两个服务的口令策略不同：
+#   门(18080) 没有"首次访问自己设口令"的流程 → 首次装随机生成一个；
+#   剪贴板(18082) 支持首次访问时在页面上自己设 → 首次装**留空**，服务会进入设置模式。
+# 显式传 -Password 时两者都用它。
+$gatePw = if ($Password -ne '') { $Password } elseif ($oldGate -and $oldGate.password) { [string]$oldGate.password } else { New-RandomPassword }
+$chatPw = if ($Password -ne '') { $Password } elseif ($null -ne $oldChat.password) { [string]$oldChat.password } else { '' }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 if (-not $desktop) { $desktop = Join-Path $env:USERPROFILE 'Desktop' }
@@ -229,14 +235,14 @@ $gateConfig = [ordered]@{
     port     = $gatePort
     webPort  = if ($oldGate -and $oldGate.webPort) { [int]$oldGate.webPort } else { 0 }  # 0 = 自动探测 DSH web 端口
     address  = ''      # 空 = 按客户端请求的 Host 当场签发（任意本机 IP 都能用）
-    password = $pw
+    password = $gatePw
     _comment = 'port=门监听端口；webPort=DSH web 端口(0=自动探测)；address 留空=按访问方用的本机 IP 签发；改完重启服务。'
 }
 Write-JsonFile -Path $gateConfigPath -Object $gateConfig
 
 $chatConfig = [ordered]@{
     port            = $chatPort
-    password        = $pw
+    password        = $chatPw
     # 0 = 不限。单文件/单次传输走流式落盘，所以新装默认就不限。
     maxFileMB       = Get-IntOr $oldChat.maxFileMB 0
     maxRequestMB    = Get-IntOr $oldChat.maxRequestMB 0
@@ -250,7 +256,12 @@ $chatConfig = [ordered]@{
 }
 Write-JsonFile -Path $chatConfigPath -Object $chatConfig
 
-Say ("配置已写入：门 {0} / 剪贴板 {1} / 口令 {2}" -f $gatePort, $chatPort, $pw) 'ok'
+Say ("配置已写入：门 {0}（口令 {1}）/ 剪贴板 {2}" -f $gatePort, $gatePw, $chatPort) 'ok'
+if ($chatPw -eq '') {
+    Say ("剪贴板还没设口令：在那台机器上打开 http://127.0.0.1:{0}/ 现场设一个（从局域网设需要日志里的设置码）" -f $chatPort) 'ok'
+} else {
+    Say ("剪贴板口令：{0}" -f $chatPw) 'ok'
+}
 Say ("桌面落盘：{0}" -f (Join-Path $desktop $mdName)) 'ok'
 
 # ==========================================================================

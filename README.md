@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 1. checks Node.js and locates DSH
 2. copies `services\` and `scripts\` to `%LOCALAPPDATA%\pair-gate-and-clipboard`
-3. writes `config\*.json` — desktop paths derived from the *current* user, ports/password preserved from any existing config (first run: ports 18080/18082, password **randomly generated** and printed)
+3. writes `config\*.json` — desktop paths derived from the *current* user, ports/password preserved from any existing config. On a fresh install the gate (18080) gets a **randomly generated** 8-character password (printed), while the clipboard service (18082) is left with an **empty password** so it starts in first-run setup mode (see below)
 4. applies the DSH Web auth patch (required for "works from any IP, survives restarts")
 5. adds firewall rules (TCP, `LocalSubnet`, `Profile Any`)
 6. registers scheduled tasks: **start at boot** + **re-apply the auth patch daily** (a DSH upgrade overwrites it)
@@ -43,6 +43,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 powershell -File "$env:LOCALAPPDATA\pair-gate-and-clipboard\scripts\supervisor.ps1" -Info
 powershell -File "$env:LOCALAPPDATA\pair-gate-and-clipboard\scripts\doctor.ps1"
 ```
+
+### First-run password setup
+
+With no password configured, the clipboard service (18082) no longer refuses to start — it enters
+**setup mode**: nobody can log in until the first visitor sets a password. The password is written
+back to the config file and takes effect immediately, no restart needed.
+
+| Opened from | What it takes |
+| --- | --- |
+| **This machine** — `http://127.0.0.1:18082/` | Straight to the setup page; type the new password twice |
+| **The LAN** — `http://<local-IP>:18082/` | The setup page also asks for a 6-digit **one-time setup code**, printed to the local log (`<install>\logs\lan-chat.log`, as `首次设置码：123456`) |
+
+Why the LAN path needs the extra code: this service writes files to your Desktop from anywhere on
+the LAN. If it sat there with an empty password waiting for the first visitor, anyone on the LAN
+could claim it first and set *their* password — effectively handing over the machine. The setup code
+lives only in memory, dies the moment setup succeeds, and is printed only in the local console, so
+knowing it proves you are at the machine. From loopback that proof is unnecessary.
+
+Password rules: at least 4 characters, both entries identical, no leading/trailing spaces, and not a
+well-known value such as the historical default `0322`. While in setup mode `/healthz` reports
+`"setup": true` and every other endpoint returns 503.
+
+> The pairing gate (18080) has **no** such flow — its `password` must be non-empty, and `install.ps1`
+> generates a random 8-character one on first install and prints it.
 
 ## Works from any local IP
 
@@ -127,9 +151,12 @@ Deliberate constraints:
   verifies unpacked paths stay inside `assetsDir`, exposes no directory index, and forces non-image
   downloads to `attachment`.
 * Known trade-offs: plain HTTP on the LAN, and the password is stored in clear text in the config.
-  A fresh install gets a **randomly generated 8-character password**; the repo ships no usable default
-  (the example configs carry the placeholder `CHANGE-ME`). Use a longer password, narrow the firewall
-  rule and/or an SSH tunnel if you need more.
+  The repo ships **no usable default password**: the clipboard service starts with an empty password
+  and asks you to set one on first access, while the gate gets a randomly generated 8-character one.
+  Use a longer password, narrow the firewall rule and/or an SSH tunnel if you need more.
+* Trust model for first-run setup: from loopback (127.0.0.1) you can set the password directly; from
+  the LAN you must supply the one-time setup code printed in the local log. So you never have to walk
+  over and copy a random password off the screen, and nobody on the LAN can claim the service first.
 
 ## License
 

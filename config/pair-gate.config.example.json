@@ -4,6 +4,6 @@
   "address": "",
   "password": "CHANGE-ME",
   "_comment": "port=配对门监听端口；webPort=本机 DSH web 端口（0=自动探测，探测不到用 3080）；address 留空=按访问方使用的本机 IP 当场签发（任意本机 IP 都能用，DHCP 换地址不用改）；填了就固定用该地址。改完重启服务生效。",
-  "_password": "上面的 CHANGE-ME 只是占位符，请换成你自己的口令。走 install.ps1 安装时它会自动生成一个 8 位随机口令并打印出来，不会用这个占位符。",
+  "_password": "上面的 CHANGE-ME 只是占位符，请换成你自己的口令。配对门（18080）没有「首次访问自己设口令」的流程，所以这里必须填一个非空值；install.ps1 首次安装会随机生成一个 8 位口令并打印出来。（剪贴板服务 18082 不同：它的 password 留空即进入设置模式，见 chat.config.example.json。）",
   "_env": "环境变量 PAIR_GATE_CONFIG / PAIR_GATE_DATA_DIR / PAIR_GATE_PORT / PAIR_GATE_WEB_PORT / PAIR_GATE_ADDRESS / PAIR_GATE_PASSWORD 可覆盖。"
 }

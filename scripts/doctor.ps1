@@ -105,7 +105,8 @@ Write-Host '2) 配置'
 $gateCfg = Read-JsonFile -Path (Join-Path $Root 'config\pair-gate.config.json')
 $chatCfg = Read-JsonFile -Path (Join-Path $Root 'config\chat.config.json')
 Check -Name 'pair-gate 配置' -Ok ([bool]$gateCfg) -Detail $(if ($gateCfg) { 'port=' + $gateCfg.port + ' password=' + ('*' * ([string]$gateCfg.password).Length) } else { '缺失' })
-Check -Name 'chat 配置' -Ok ([bool]$chatCfg) -Detail $(if ($chatCfg) { 'port=' + $chatCfg.port + ' md=' + $chatCfg.desktopMd } else { '缺失' })
+$chatPwText = if (-not $chatCfg) { '' } elseif ("$($chatCfg.password)" -eq '') { '未设置(设置模式)' } else { '*' * ([string]$chatCfg.password).Length }
+Check -Name 'chat 配置' -Ok ([bool]$chatCfg) -Detail $(if ($chatCfg) { 'port=' + $chatCfg.port + ' md=' + $chatCfg.desktopMd + ' 口令=' + $chatPwText } else { '缺失' })
 $gatePort = if ($gateCfg -and $gateCfg.port) { [int]$gateCfg.port } else { 18080 }
 $chatPort = if ($chatCfg -and $chatCfg.port) { [int]$chatCfg.port } else { 18082 }
 $webPort = if ($gateCfg -and $gateCfg.webPort -and [int]$gateCfg.webPort -gt 0) { [int]$gateCfg.webPort } else { 3080 }

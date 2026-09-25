@@ -15,7 +15,9 @@
  *
  * 端点
  *   GET  /            未授权 → 口令页；已授权 → 聊天界面
+ *                     还没设口令时 → 首次设置页（见下）
  *   POST /unlock      表单口令 → 下发会话 cookie
+ *   POST /setup       首次设置口令（仅未设口令时可用；本机回环直通，局域网需一次性设置码）
  *   GET  /logout
  *   GET  /config      当前可用地址、上限、设备名（前端引导用）
  *   GET  /history     历史消息（JSON，支持 limit/before）
@@ -24,6 +26,14 @@
  *   GET  /f/<路径>    下载/内联查看附件（严格校验，防路径穿越）
  *   GET  /d/<目录>    目录树列表页（手机端查看"文件夹"内容）
  *   GET  /healthz     存活探针（不含任何秘密）
+ *
+ * 首次设置口令（password 留空时）
+ *   配置里没写 password 时服务不再拒绝启动，而是进入"设置模式"：谁都还没法登录，
+ *   直到有人设一个口令。设置完写回配置文件并立即生效，无需重启。
+ *   * 本机（127.0.0.1）打开 / 直接就能设 —— 人在机器前面，这就是足够的信任凭证。
+ *   * 局域网打开 / 需要输入一次性"设置码"（启动时打印到日志）—— 否则局域网里
+ *     任何人都可能抢先把口令设成自己的，等于把这个写桌面的服务拱手让人。
+ *   * 设置码只存在内存里，设置成功后即失效。
  *
  * 安全（因为会往桌面写文件，这几条是硬要求）
  *   * 口令鉴权（cookie 会话 + HTTP Basic），失败按 IP 限速封禁；
@@ -38,7 +48,7 @@
  */
 
 import { createServer } from 'node:http'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
 import {
   appendFileSync,
   closeSync,
@@ -76,11 +86,28 @@ try {
 }
 
 const PORT = Number(process.env.LANCHAT_PORT ?? CFG.port ?? 18082)
-const PASSWORD = String(process.env.LANCHAT_PASSWORD ?? CFG.password ?? '')
-if (PASSWORD === '') {
-  console.error(`lan-chat: ${CONFIG_PATH} 缺少 password，拒绝启动`)
-  process.exit(2)
-}
+
+/**
+ * 口令允许"还没设"：这时不再拒绝启动，而是进入**设置模式** —— 谁都还登录不了，
+ * 直到第一次访问的人把口令设出来。设完写回配置文件并立即生效，所以这里必须是 let。
+ * （LANCHAT_PASSWORD 环境变量给了非空值时以它为准，不走设置模式。）
+ */
+const envPassword = process.env.LANCHAT_PASSWORD
+const PASSWORD_FROM_ENV = typeof envPassword === 'string' && envPassword !== ''
+let PASSWORD = PASSWORD_FROM_ENV ? envPassword : String(CFG.password ?? '')
+let NEEDS_SETUP = !PASSWORD_FROM_ENV && PASSWORD === ''
+
+/**
+ * 一次性设置码。只在"从局域网来设口令"时需要：否则局域网里任何人都可能抢先
+ * 把口令设成自己的 —— 那等于把这个能往桌面写文件的服务拱手让人。
+ * 本机回环访问不需要它（人在机器前面，这本身就是足够的信任凭证）。
+ * 只存在内存里，设置成功后立即失效；日志里会打印，方便你在本机读出来。
+ */
+const SETUP_CODE = NEEDS_SETUP ? randomInt(0, 1000000).toString().padStart(6, '0') : ''
+
+/** 本机回环（127.0.0.0/8 与 ::1）—— 设置口令时用它判定"人在机器前面"。 */
+const isLoopback = (ip) =>
+  ip === '::1' || ip === '::ffff:127.0.0.1' || /^127\./.test(ip) || /^::ffff:127\./.test(ip)
 
 const DATA_DIR = CFG.dataDir ?? join(HERE, 'data')
 const MD_PATH = CFG.desktopMd
@@ -621,13 +648,84 @@ function loginPage(failed) {
 <title>手机剪贴板</title><style>${LOGIN_CSS}</style>
 <h1>输入口令，进入手机剪贴板</h1>
 <form method="post" action="/unlock">
-  <input type="password" name="password" inputmode="numeric" autofocus autocomplete="current-password" required>
+  <input type="password" name="password" autofocus autocomplete="current-password" required>
   <button type="submit">进入</button>
 </form>
 ${failed ? '<p class="err">口令不对，再试一次。</p>' : ''}
 <p class="hint">发来的文本/图片/文件会自动写进电脑桌面的 <code>手机剪贴板.md</code>。</p>
 ${urls.length > 1 ? `<p class="hint">本机当前可用的入口（换网络后可能变）：</p><ul>${urls.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join('')}</ul>` : ''}
 </html>`
+}
+
+// ---------------------------------------------------------------------------
+// 首次设置口令
+// ---------------------------------------------------------------------------
+
+const SETUP_CSS = `${LOGIN_CSS}
+form{display:grid;gap:.55rem;max-width:22rem}
+form input[type=password],form input[type=text]{width:100%}
+form button{margin-left:0}`
+
+/**
+ * 首次设置页。needCode=true 时（从局域网访问）要多填一个一次性设置码。
+ * 为什么不一视同仁地都要码：本机回环访问的人是坐在机器前面的，
+ * 让他再去日志里抄码只是徒增麻烦；而局域网来的必须证明"我知道机器上印的东西"。
+ */
+function setupPage(needCode, error) {
+  const urls = localUrls()
+  return `<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>首次设置口令 · 手机剪贴板</title><style>${SETUP_CSS}</style>
+<h1>这台机器还没有口令</h1>
+<p class="hint">设一个之后，手机 / 其他电脑打开本页都要输它。</p>
+<form method="post" action="/setup">
+${needCode ? '  <input type="text" name="code" inputmode="numeric" autocomplete="off" placeholder="设置码（6 位）" required>\n' : ''}  <input type="password" name="password" autocomplete="new-password" minlength="4" placeholder="新口令（至少 4 位）" required>
+  <input type="password" name="confirm" autocomplete="new-password" minlength="4" placeholder="再输一遍" required>
+  <button type="submit">保存并进入</button>
+</form>
+${error ? `<p class="err">${escapeHtml(error)}</p>` : ''}
+${needCode ? '<p class="hint">设置码在<b>本机</b>的日志里：<code>&lt;安装目录&gt;\\logs\\lan-chat.log</code>，形如「首次设置码：123456」。只在你亲手打开的本机窗口里抄得到，所以它能证明你确实在这台机器旁边。</p>' : ''}
+<p class="hint">口令会写进 <code>${escapeHtml(CONFIG_PATH)}</code> 并立即生效，不用重启。</p>
+${needCode && urls.length > 1 ? `<p class="hint">本机入口（在那台电脑上打开就能免设置码）：</p><ul>${urls.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join('')}</ul>` : ''}
+</html>`
+}
+
+/** 局域网访问但没填对设置码时的提示页。 */
+function setupCodeRequiredPage() {
+  return `<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>需要设置码 · 手机剪贴板</title><style>${LOGIN_CSS}</style>
+<h1>这台机器还没设口令</h1>
+<p>出于安全，从局域网设置口令需要先输入一次性设置码 —— 否则局域网里任何人都可能抢先把口令设成自己的。</p>
+<p class="hint">设置码打印在<b>本机</b>日志里：<code>&lt;安装目录&gt;\\logs\\lan-chat.log</code>，形如「首次设置码：123456」。</p>
+<p class="hint">或者直接在这台电脑上打开 <code>http://127.0.0.1:${PORT}/</code>，那里不用设置码。</p>
+<p class="hint"><a href="/">← 回到设置页</a></p>
+</html>`
+}
+
+const WEAK_PASSWORDS = new Set(['0322', 'change-me', 'changeme', 'password', '1234', '123456', 'admin'])
+
+/** 校验新口令；返回错误文案，通过则返回 null。 */
+function validateNewPassword(pw, confirm) {
+  if (pw === '') return '口令不能为空。'
+  if (pw !== pw.trim()) return '口令首尾不要留空格。'
+  if (pw.length < 4) return '口令至少 4 位。'
+  if (pw !== confirm) return '两次输入不一致。'
+  if (WEAK_PASSWORDS.has(pw.toLowerCase())) return '这个口令太常见了（也是历史默认值），换一个。'
+  return null
+}
+
+/** 把新口令写回配置文件（原子写：临时文件 + 改名）。 */
+function savePasswordToConfig(newPassword) {
+  const cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+  cfg.password = newPassword
+  const tmp = `${CONFIG_PATH}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8')
+  renameSync(tmp, CONFIG_PATH)
 }
 
 function dirListing(dirName, entries, reqQuery) {
@@ -708,7 +806,73 @@ const server = createServer(async (req, res) => {
   if (path !== '/events') log(`req ${ip} ${req.method} ${path}`)
 
   if (path === '/healthz') {
-    json(res, 200, { ok: true, service: 'lan-chat', port: PORT })
+    json(res, 200, { ok: true, service: 'lan-chat', port: PORT, ...(NEEDS_SETUP ? { setup: true } : {}) })
+    return
+  }
+
+  // -------------------------------------------------------------------------
+  // 首次设置口令：还没设口令时，除设置相关外一律挡住
+  // -------------------------------------------------------------------------
+  if (NEEDS_SETUP) {
+    const loopback = isLoopback(ip)
+
+    if (path === '/') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(setupPage(!loopback))
+      return
+    }
+
+    if (path === '/setup' && req.method === 'POST') {
+      let form
+      try {
+        form = new URLSearchParams((await readBody(req, 4096)).toString('utf8'))
+      } catch {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('bad request\n')
+        return
+      }
+
+      if (!loopback) {
+        const given = String(form.get('code') ?? '').trim()
+        if (!passwordMatches(SETUP_CODE, given)) {
+          log(`setup: 设置码不对，来自 ${ip}`)
+          res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(setupCodeRequiredPage())
+          return
+        }
+      }
+
+      const pw = String(form.get('password') ?? '')
+      const problem = validateNewPassword(pw, String(form.get('confirm') ?? ''))
+      if (problem !== null) {
+        res.writeHead(400, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(setupPage(!loopback, problem))
+        return
+      }
+
+      try {
+        savePasswordToConfig(pw)
+      } catch (error) {
+        log(`setup: 写配置失败：${error.message}`)
+        res.writeHead(500, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(setupPage(!loopback, `写配置失败：${error.message}`))
+        return
+      }
+
+      PASSWORD = pw
+      NEEDS_SETUP = false
+      log(`setup: 口令已设置并写入 ${CONFIG_PATH}（来自 ${ip}，${loopback ? '本机' : '局域网'}）`)
+      res.writeHead(302, {
+        location: '/',
+        'set-cookie': `${COOKIE}=${SESSION}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`,
+        'cache-control': 'no-store',
+      })
+      res.end()
+      return
+    }
+
+    res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+    res.end('setup required\n')
     return
   }
 
@@ -1134,4 +1298,8 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`ready on http://0.0.0.0:${PORT}/ · 入口 ${localUrls().join(' , ') || '(仅回环)'}`)
   log(`markdown -> ${MD_PATH}`)
   log(`assets   -> ${ASSETS_DIR}`)
+  if (NEEDS_SETUP) {
+    log(`⚠ 还没设口令：在本机打开 http://127.0.0.1:${PORT}/ 就能设（局域网访问要设置码）`)
+    log(`  首次设置码：${SETUP_CODE}`)
+  }
 })

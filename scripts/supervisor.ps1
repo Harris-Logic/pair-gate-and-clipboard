@@ -249,7 +249,8 @@ if ($Info) {
     Write-Host ('配置文件    : {0}' -f $configDir)
     if ($lanIps.Count -gt 0) {
         Write-Host ('配对门入口  : {0}   口令 {1}' -f ((@($lanIps | ForEach-Object { 'http://{0}:{1}/' -f $_, $gatePort }) -join '  '), $(if ($gateCfg) { $gateCfg.password } else { '?' })))
-        Write-Host ('手机剪贴板  : {0}   口令 {1}' -f ((@($lanIps | ForEach-Object { 'http://{0}:{1}/' -f $_, $chatPort }) -join '  '), $(if ($chatCfg) { $chatCfg.password } else { '?' })))
+        $chatPwText = if (-not $chatCfg) { '?' } elseif ("$($chatCfg.password)" -eq '') { '未设置（首次访问时在页面上设）' } else { [string]$chatCfg.password }
+        Write-Host ('手机剪贴板  : {0}   口令 {1}' -f ((@($lanIps | ForEach-Object { 'http://{0}:{1}/' -f $_, $chatPort }) -join '  '), $chatPwText))
     } else {
         Write-Host '配对门入口  : (未检测到局域网 IPv4 地址)' -ForegroundColor Yellow
     }
