@@ -30,6 +30,10 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 ```
 
+> 脚本会自动定位源码树（`$PSScriptRoot` → 父目录 → 祖父目录，以 `services\pair-gate\gate.mjs`
+> 为判定）。如果你的目录结构比较特殊，用 `-Source <仓库路径>` 显式指定即可。
+> 注意 `install.ps1` 已被复制到 `scripts\` 下时也能直接运行（会自动往上一层找）。
+
 安装脚本会做 7 件事（幂等，重复运行安全）：
 
 1. 检查 Node.js 与 DSH 位置
