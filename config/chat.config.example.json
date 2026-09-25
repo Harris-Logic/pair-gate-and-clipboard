@@ -1,0 +1,14 @@
+{
+  "port": 18082,
+  "password": "0322",
+  "maxFileMB": 100,
+  "maxRequestMB": 200,
+  "maxZipEntries": 5000,
+  "maxZipTotalMB": 500,
+  "mdOrder": "newest-first",
+  "desktopMd": "",
+  "assetsDir": "",
+  "dataDir": "",
+  "_comment": "password=进入口令；desktopMd=时间线 Markdown 落盘位置；assetsDir=附件目录（须与 .md 同级）；dataDir=消息真相源目录；mdOrder=newest-first|oldest-first。desktopMd/assetsDir/dataDir 留空时由 install.ps1 按当前用户桌面自动填。改完重启服务生效。",
+  "_env": "环境变量 LANCHAT_CONFIG / LANCHAT_PORT / LANCHAT_PASSWORD 可覆盖。"
+}

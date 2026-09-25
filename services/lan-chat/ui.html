@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>手机剪贴板</title>
+<style>
+  :root{
+    color-scheme: light dark;
+    --bg:#f4f6f8; --panel:#fff; --ink:#111; --mut:#6b7280; --line:#e5e7eb;
+    --me:#2f6fed; --meInk:#fff; --you:#fff; --youInk:#111;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0f1115; --panel:#171a21; --ink:#e8eaed; --mut:#9aa0a6; --line:#2a2f3a;
+           --me:#2f6fed; --you:#232833; --youInk:#e8eaed; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       display:flex;flex-direction:column;height:100dvh}
+  header{background:var(--panel);border-bottom:1px solid var(--line);padding:.5rem .75rem;
+         display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;flex:0 0 auto}
+  header h1{font-size:1rem;margin:0;flex:1 1 auto}
+  header .u{font-size:.75rem;color:var(--mut);max-width:100%;overflow-wrap:anywhere}
+  header input{font-size:.85rem;padding:.25rem .4rem;width:9rem;border:1px solid var(--line);
+               border-radius:.35rem;background:transparent;color:inherit}
+  header a{font-size:.8rem;color:var(--mut)}
+  #list{flex:1 1 auto;overflow-y:auto;padding:.75rem;display:flex;flex-direction:column;gap:.6rem;
+        -webkit-overflow-scrolling:touch}
+  .row{display:flex}
+  .row.me{justify-content:flex-end}
+  .bub{max-width:min(42rem,88%);background:var(--you);color:var(--youInk);border-radius:1rem;
+       padding:.5rem .7rem;box-shadow:0 1px 2px #0002;overflow-wrap:anywhere}
+  .row.me .bub{background:var(--me);color:var(--meInk)}
+  .meta{font-size:.7rem;opacity:.7;margin-bottom:.2rem}
+  .text{white-space:pre-wrap}
+  .bub img{max-width:100%;max-height:18rem;border-radius:.6rem;margin-top:.35rem;display:block;cursor:zoom-in}
+  .bub ul{margin:.35rem 0 0;padding-left:1.1rem}
+  .bub a{color:inherit}
+  details{margin-top:.35rem}
+  summary{cursor:pointer;font-weight:600}
+  footer{flex:0 0 auto;background:var(--panel);border-top:1px solid var(--line);
+         padding:.5rem .6rem calc(.5rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.4rem}
+  .files{display:flex;flex-wrap:wrap;gap:.35rem}
+  .chip{font-size:.75rem;background:#8882;border-radius:1rem;padding:.15rem .55rem;display:flex;gap:.35rem;align-items:center}
+  .chip button{border:0;background:none;color:inherit;cursor:pointer;font-size:.9rem;padding:0}
+  .compose{display:flex;gap:.4rem;align-items:flex-end}
+  textarea{flex:1 1 auto;resize:none;min-height:2.6rem;max-height:8rem;font:inherit;padding:.55rem .7rem;
+           border:1px solid var(--line);border-radius:1.1rem;background:transparent;color:inherit}
+  button.act{font:inherit;font-size:1.05rem;border:0;border-radius:1.1rem;padding:.55rem .95rem;
+             background:var(--me);color:#fff;cursor:pointer;white-space:nowrap}
+  button.ghost{background:#8882;color:inherit}
+  label.ghost{font-size:1.15rem;background:#8882;border-radius:1.1rem;padding:.4rem .7rem;cursor:pointer}
+  input[type=file]{display:none}
+  #bar{height:.25rem;background:var(--line);border-radius:1rem;overflow:hidden;display:none}
+  #bar i{display:block;height:100%;width:0;background:var(--me);transition:width .15s}
+  #toast{position:fixed;left:50%;bottom:5.5rem;transform:translateX(-50%);background:#000c;color:#fff;
+         padding:.5rem .9rem;border-radius:1rem;font-size:.85rem;display:none;max-width:90%}
+  .hint{font-size:.7rem;color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <h1>手机剪贴板</h1>
+  <input id="device" placeholder="本机名称" title="这个名字会写进聊天记录">
+  <a href="/logout">退出</a>
+  <div class="u" id="urls"></div>
+</header>
+
+<div id="list"></div>
+
+<footer>
+  <div class="files" id="chips"></div>
+  <div id="bar"><i></i></div>
+  <div class="compose">
+    <label class="ghost" title="附件">📎<input type="file" id="pick" multiple></label>
+    <label class="ghost" title="文件夹（先压成 zip）">🗂<input type="file" id="pickZip" accept=".zip,application/zip"></label>
+    <textarea id="text" rows="1" placeholder="输入文字，或长按粘贴 / 拖入文件…"></textarea>
+    <button class="act" id="send">发送</button>
+  </div>
+  <div class="hint" id="hint"></div>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+const listEl = document.getElementById('list')
+const textEl = document.getElementById('text')
+const chipsEl = document.getElementById('chips')
+const barEl = document.getElementById('bar')
+const barIn = barEl.querySelector('i')
+const toastEl = document.getElementById('toast')
+const deviceEl = document.getElementById('device')
+
+let attachments = []   // File[]
+let zipFile = null
+let messages = []
+let device = localStorage.getItem('lanchat.device') || ''
+deviceEl.value = device
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+const humanSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB'
+  : n < 1073741824 ? (n/1048576).toFixed(1) + ' MB' : (n/1073741824).toFixed(2) + ' GB'
+const humanTime = (ms) => { const d = new Date(ms), p = (x) => String(x).padStart(2,'0')
+  return p(d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) }
+
+function toast(msg, ms = 2600) {
+  toastEl.textContent = msg
+  toastEl.style.display = 'block'
+  clearTimeout(toast._t)
+  toast._t = setTimeout(() => { toastEl.style.display = 'none' }, ms)
+}
+
+function fileLinks(f) {
+  const rel = encodeURI(f.stored)
+  if (f.kind === 'image') {
+    return '<a href="/f/' + rel + '" target="_blank"><img src="/f/' + rel + '" loading="lazy" alt="' + esc(f.name) + '"></a>'
+  }
+  if (f.kind === 'folder') {
+    const items = (f.entries || []).map((e) =>
+      '<li><a href="/f/' + encodeURI(f.stored + '/' + e.path) + '">' + esc(e.path) + '</a> <span style="opacity:.6">' + humanSize(e.size) + '</span></li>').join('')
+    return '<details><summary>📁 ' + esc(f.name) + '（' + (f.entries||[]).length + ' 个文件）</summary><ul>' + items +
+           '</ul><div class="hint"><a href="/d/' + rel + '" target="_blank">在新页打开目录</a></div></details>'
+  }
+  return '<div>📎 <a href="/f/' + rel + '" download>' + esc(f.name) + '</a> <span style="opacity:.6">' + humanSize(f.size) + '</span></div>'
+}
+
+function bubble(m) {
+  const mine = device && m.device === device
+  const div = document.createElement('div')
+  div.className = 'row' + (mine ? ' me' : '')
+  div.dataset.id = m.id
+  div.innerHTML = '<div class="bub"><div class="meta">' + esc(m.device || '未知设备') + ' · ' + humanTime(m.ts) + '</div>' +
+    (m.text ? '<div class="text">' + esc(m.text) + '</div>' : '') +
+    (m.files || []).map(fileLinks).join('') + '</div>'
+  return div
+}
+
+function renderAll() {
+  listEl.innerHTML = ''
+  for (const m of messages) listEl.appendChild(bubble(m))
+  listEl.scrollTop = listEl.scrollHeight
+}
+
+function appendMessage(m) {
+  if (messages.some((x) => x.id === m.id)) return
+  const nearBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 120
+  messages.push(m)
+  listEl.appendChild(bubble(m))
+  if (nearBottom) listEl.scrollTop = listEl.scrollHeight
+}
+
+function renderChips() {
+  chipsEl.innerHTML = ''
+  const all = zipFile ? [...attachments, zipFile] : attachments
+  all.forEach((f, i) => {
+    const chip = document.createElement('span')
+    chip.className = 'chip'
+    chip.innerHTML = (f === zipFile ? '🗂 ' : '📎 ') + esc(f.name) + ' <span style="opacity:.6">' + humanSize(f.size) + '</span>'
+    const btn = document.createElement('button')
+    btn.textContent = '×'
+    btn.onclick = () => { if (f === zipFile) zipFile = null; else attachments.splice(i, 1); renderChips() }
+    chip.appendChild(btn)
+    chipsEl.appendChild(chip)
+  })
+}
+
+async function boot() {
+  try {
+    const cfg = await (await fetch('/config')).json()
+    document.getElementById('urls').textContent = '本机入口：' + (cfg.urls || []).join('  ')
+    document.getElementById('hint').textContent =
+      '上限：单文件 ' + cfg.limits.maxFileMB + ' MB / 单次 ' + cfg.limits.maxRequestMB + ' MB · 文件夹请先压成 zip 再发'
+    if (device === '') {
+      device = 'Android 设备'
+      deviceEl.value = device
+    }
+  } catch { /* 配置读不到不影响发送 */ }
+  const hist = await (await fetch('/history?limit=200')).json()
+  messages = hist.messages || []
+  renderAll()
+  const es = new EventSource('/events')
+  es.onmessage = (e) => { try { appendMessage(JSON.parse(e.data)) } catch {} }
+  es.onerror = () => { /* EventSource 会自动重连 */ }
+}
+
+deviceEl.addEventListener('change', () => {
+  device = deviceEl.value.trim() || '未命名设备'
+  deviceEl.value = device
+  localStorage.setItem('lanchat.device', device)
+  renderAll()
+})
+
+document.getElementById('pick').addEventListener('change', (e) => {
+  attachments = attachments.concat([...e.target.files])
+  e.target.value = ''
+  renderChips()
+})
+document.getElementById('pickZip').addEventListener('change', (e) => {
+  zipFile = e.target.files[0] || null
+  e.target.value = ''
+  renderChips()
+})
+
+textEl.addEventListener('input', () => {
+  textEl.style.height = 'auto'
+  textEl.style.height = Math.min(textEl.scrollHeight, 128) + 'px'
+})
+textEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+})
+// 长按粘贴：图片进附件，文本照常进输入框
+for (const el of [textEl, document.getElementById('list')]) {
+  el.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])]
+    if (files.some((f) => f.type.startsWith('image/'))) {
+      e.preventDefault()
+      attachments = attachments.concat(files)
+      renderChips()
+      toast('已加入 ' + files.length + ' 个图片附件')
+    }
+  })
+}
+// 拖拽
+for (const ev of ['dragover', 'drop']) {
+  document.addEventListener(ev, (e) => {
+    e.preventDefault()
+    if (ev === 'drop' && e.dataTransfer?.files?.length) {
+      const fs = [...e.dataTransfer.files]
+      const z = fs.find((f) => /\.zip$/i.test(f.name))
+      if (z && fs.length === 1) zipFile = z
+      else attachments = attachments.concat(fs)
+      renderChips()
+    }
+  })
+}
+
+async function send() {
+  const text = textEl.value.trim()
+  if (text === '' && attachments.length === 0 && !zipFile) { toast('没有可发送的内容'); return }
+  const fd = new FormData()
+  fd.append('text', text)
+  fd.append('device', device || '未命名设备')
+  for (const f of attachments) fd.append('files', f, f.name)
+  if (zipFile) fd.append('zip', zipFile, zipFile.name)
+
+  document.getElementById('send').disabled = true
+  barEl.style.display = 'block'
+  barIn.style.width = '0%'
+  try {
+    const ok = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', '/send')
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) barIn.style.width = (e.loaded / e.total * 100).toFixed(0) + '%' }
+      xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)) } catch { resolve({ ok: false, error: 'HTTP ' + xhr.status }) } }
+      xhr.onerror = () => resolve({ ok: false, error: '网络错误' })
+      xhr.send(fd)
+    })
+    if (!ok.ok) { toast('发送失败：' + ok.error); return }
+    textEl.value = ''
+    textEl.style.height = 'auto'
+    attachments = []
+    zipFile = null
+    renderChips()
+    toast('已写入桌面 手机剪贴板.md')
+  } finally {
+    document.getElementById('send').disabled = false
+    barEl.style.display = 'none'
+  }
+}
+document.getElementById('send').addEventListener('click', send)
+
+boot()
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "name": "pair-gate-and-clipboard",
+  "version": "0.1.0",
+  "description": "Standalone Windows LAN services: a password-gated pairing gate (any local IP -> DSH Web, no manual pairing) plus a LAN clipboard/file channel that mirrors messages into a Desktop Markdown file. Zero npm dependencies. Not a DSH plugin.",
+  "keywords": [
+    "windows",
+    "lan",
+    "pairing",
+    "pair-gate",
+    "clipboard",
+    "powershell",
+    "nodejs"
+  ],
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "install-service": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1",
+    "doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor.ps1",
+    "info": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/supervisor.ps1 -Info"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Harris-Logic/pair-gate-and-clipboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Harris-Logic/pair-gate-and-clipboard/issues"
+  },
+  "homepage": "https://github.com/Harris-Logic/pair-gate-and-clipboard#readme"
+}
