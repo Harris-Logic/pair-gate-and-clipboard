@@ -19,7 +19,8 @@
   "scripts": {
     "install-service": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1",
     "doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor.ps1",
-    "info": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/supervisor.ps1 -Info"
+    "info": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/supervisor.ps1 -Info",
+    "push": "node scripts/push-via-api.mjs"
   },
   "license": "MIT",
   "repository": {

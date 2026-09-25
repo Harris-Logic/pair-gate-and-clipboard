@@ -5,7 +5,8 @@
       1. 检查 Node.js（>=18）与本机 DSH 安装位置。
       2. 把 services/ scripts/ 复制到安装目录（默认 %LOCALAPPDATA%\pair-gate-and-clipboard）。
       3. 生成/更新 config\*.json：桌面文档与附件目录按当前用户自动推导，
-         口令沿用已有配置（首次为 0322），端口沿用已有配置（首次 18080/18082）。
+         口令沿用已有配置（首次**随机生成一个 8 位口令并打印出来**），
+         端口沿用已有配置（首次 18080/18082）。
       4. 打 DSH Web 鉴权补丁（scripts\dsh-web-auth-patch.ps1）——
          没有它，"换 IP / 重启后仍然免配对"不成立，详见 README。
       5. 加防火墙规则（TCP，LocalSubnet，Profile Any）。
@@ -181,6 +182,35 @@ Say ("已复制 {0} 个文件到 {1}" -f $copied, $Root) 'ok'
 # ==========================================================================
 # 3. 生成/更新配置
 # ==========================================================================
+
+# 首次安装用的口令：随机生成，不再写死默认值。
+# 为什么不写死：这个服务能在局域网里往桌面写文件，一个"人人皆知"的默认口令
+# 等于没有口令。8 位、去掉容易看错的 0/O/1/l/I；用密码学随机源 + 拒绝采样
+# （取模会把字符分布带偏，这里只接受落在完整区间内的字节）。
+function New-RandomPassword {
+    param([int]$Length = 8)
+    $alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    $limit = [math]::Floor(256 / $alphabet.Length) * $alphabet.Length
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] 1
+    $chars = New-Object System.Collections.Generic.List[char]
+    while ($chars.Count -lt $Length) {
+        $rng.GetBytes($buf)
+        if ($buf[0] -lt $limit) { $chars.Add($alphabet[$buf[0] % $alphabet.Length]) }
+    }
+    $rng.Dispose()
+    return (-join $chars)
+}
+
+# 读配置时保留"显式写下的 0"。
+# 注意：0 在 PowerShell 里是 falsy，用真值判断会把用户特意设的 0（= 不限）
+# 当成"没配"而重置回默认值 —— 那正好把"去掉大小限制"这件事抹掉了。
+function Get-IntOr {
+    param($Value, [int]$Default)
+    if ($null -eq $Value -or "$Value" -eq '') { return $Default }
+    return [int]$Value
+}
+
 $gateConfigPath = Join-Path $Root 'config\pair-gate.config.json'
 $chatConfigPath = Join-Path $Root 'config\chat.config.json'
 $oldGate = Read-JsonFile -Path $gateConfigPath
@@ -188,7 +218,7 @@ $oldChat = Read-JsonFile -Path $chatConfigPath
 
 $gatePort = if ($GatePort -gt 0) { $GatePort } elseif ($oldGate -and $oldGate.port) { [int]$oldGate.port } else { 18080 }
 $chatPort = if ($ChatPort -gt 0) { $ChatPort } elseif ($oldChat -and $oldChat.port) { [int]$oldChat.port } else { 18082 }
-$pw = if ($Password -ne '') { $Password } elseif ($oldGate -and $oldGate.password) { [string]$oldGate.password } else { '0322' }
+$pw = if ($Password -ne '') { $Password } elseif ($oldGate -and $oldGate.password) { [string]$oldGate.password } else { New-RandomPassword }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 if (-not $desktop) { $desktop = Join-Path $env:USERPROFILE 'Desktop' }
@@ -207,10 +237,11 @@ Write-JsonFile -Path $gateConfigPath -Object $gateConfig
 $chatConfig = [ordered]@{
     port            = $chatPort
     password        = $pw
-    maxFileMB       = if ($oldChat -and $oldChat.maxFileMB) { [int]$oldChat.maxFileMB } else { 100 }
-    maxRequestMB    = if ($oldChat -and $oldChat.maxRequestMB) { [int]$oldChat.maxRequestMB } else { 200 }
-    maxZipEntries   = if ($oldChat -and $oldChat.maxZipEntries) { [int]$oldChat.maxZipEntries } else { 5000 }
-    maxZipTotalMB   = if ($oldChat -and $oldChat.maxZipTotalMB) { [int]$oldChat.maxZipTotalMB } else { 500 }
+    # 0 = 不限。单文件/单次传输走流式落盘，所以新装默认就不限。
+    maxFileMB       = Get-IntOr $oldChat.maxFileMB 0
+    maxRequestMB    = Get-IntOr $oldChat.maxRequestMB 0
+    maxZipEntries   = Get-IntOr $oldChat.maxZipEntries 0
+    maxZipTotalMB   = Get-IntOr $oldChat.maxZipTotalMB 0
     mdOrder         = if ($oldChat -and $oldChat.mdOrder) { [string]$oldChat.mdOrder } else { 'newest-first' }
     desktopMd       = Join-Path $desktop $mdName
     assetsDir       = Join-Path $desktop $assetsName

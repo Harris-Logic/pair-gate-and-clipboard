@@ -33,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 1. checks Node.js and locates DSH
 2. copies `services\` and `scripts\` to `%LOCALAPPDATA%\pair-gate-and-clipboard`
-3. writes `config\*.json` — desktop paths derived from the *current* user, ports/password preserved from any existing config (first run: 18080/18082, password `0322`)
+3. writes `config\*.json` — desktop paths derived from the *current* user, ports/password preserved from any existing config (first run: ports 18080/18082, password **randomly generated** and printed)
 4. applies the DSH Web auth patch (required for "works from any IP, survives restarts")
 5. adds firewall rules (TCP, `LocalSubnet`, `Profile Any`)
 6. registers scheduled tasks: **start at boot** + **re-apply the auth patch daily** (a DSH upgrade overwrites it)
@@ -80,6 +80,32 @@ powershell -File install.ps1 -Uninstall [-Force]
 The supervisor starts the services idempotently and re-checks every 15 seconds, so a crashed service
 comes back on its own. Logs live in `<install>\logs\`, runtime state in `<install>\state\` and `run\`.
 
+### Pushing when git transport is blocked (`scripts\push-via-api.mjs`)
+
+On some networks `git push` gets cut off mid-handshake (`CONNECT tunnel failed, response 502`, reset
+TLS) while `api.github.com` stays reachable. This script moves the local commit over the GitHub Git
+Data API instead:
+
+```powershell
+$env:GH_TOKEN = '<PAT with contents:write>'
+node scripts\push-via-api.mjs --dry-run   # show the plan, create nothing on the remote
+node scripts\push-via-api.mjs             # push for real
+```
+
+It pushes **the commit that HEAD already points at**. Git objects are content-addressed, so if
+parent / tree / message / author / committer all match, the remote derives exactly the same SHA —
+afterwards the two sides are still in sync and a normal `git push` keeps working (no divergence).
+
+Deliberate constraints:
+
+* The file list comes only from git objects (`git ls-tree` / `git diff-tree`), so untracked and
+  `.gitignore`d files — e.g. `config\chat.config.json`, which holds the password — are never uploaded.
+* Every step verifies its SHA (blob / tree / commit) and aborts **before** touching the ref if anything
+  mismatches; the remote may be left with a few unreferenced dangling objects at most.
+* Fast-forward is required by default (the remote must sit exactly on the local parent); a
+  non-fast-forward fails loudly. Overriding takes an explicit `--force`.
+* The token is read from `GH_TOKEN` / `GITHUB_TOKEN` only, never written to disk.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -100,9 +126,10 @@ comes back on its own. Logs live in `<install>\logs\`, runtime state in `<instal
 * lan-chat enforces per-file / per-request / unpack-total / entry-count limits, sanitizes file names,
   verifies unpacked paths stay inside `assetsDir`, exposes no directory index, and forces non-image
   downloads to `attachment`.
-* Known trade-offs: plain HTTP on the LAN, and the password is stored in clear text in the config
-  (a 4-digit PIN is "good enough" by design; use a longer password, narrow the firewall rule and/or an
-  SSH tunnel if you need more).
+* Known trade-offs: plain HTTP on the LAN, and the password is stored in clear text in the config.
+  A fresh install gets a **randomly generated 8-character password**; the repo ships no usable default
+  (the example configs carry the placeholder `CHANGE-ME`). Use a longer password, narrow the firewall
+  rule and/or an SSH tunnel if you need more.
 
 ## License
 

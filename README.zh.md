@@ -38,7 +38,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 1. 检查 Node.js 与 DSH 位置
 2. 复制 `services\` `scripts\` 到安装目录（默认 `%LOCALAPPDATA%\pair-gate-and-clipboard`）
-3. 生成 `config\*.json`：桌面落盘路径按**当前用户**自动推导，口令/端口沿用已有配置（首次 18080/18082、口令 `0322`）
+3. 生成 `config\*.json`：桌面落盘路径按**当前用户**自动推导，端口沿用已有配置（首次 18080/18082），口令沿用已有配置（首次**随机生成 8 位并打印出来**）
 4. 给 DSH Web 打鉴权补丁（**换 IP / 重启后仍然免配对**的前提，见第 4 节）
 5. 加防火墙规则（TCP，远端范围 `LocalSubnet`，`Profile Any` —— 热点/咖啡厅也能用）
 6. 注册计划任务：**开机自启** + **每天补打一次鉴权补丁**（DSH 升级会覆盖补丁文件）
@@ -113,14 +113,14 @@ pair-gate-and-clipboard\
 | `port` | 18080 | 门监听端口（防火墙按这个放行） |
 | `webPort` | 0 | 本机 DSH Web 端口；0 = 自动探测；探测不到用 3080 |
 | `address` | `""` | 空 = 按访问方用的本机 IP 当场签发（推荐）；填了 = 固定用它 |
-| `password` | `0322` | 进门口令（失败限速：15 分钟 5 次封 15 分钟） |
+| `password` | 首次随机生成 | 进门口令（失败限速：15 分钟 5 次封 15 分钟）。示例配置里写的是占位符 `CHANGE-ME`，别照抄 |
 
 `config\chat.config.json`
 
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
 | `port` | 18082 | 监听端口 |
-| `password` | `0322` | 进入口令 |
+| `password` | 首次随机生成 | 进入口令。示例配置里是占位符 `CHANGE-ME`，别照抄 |
 | `desktopMd` / `assetsDir` | 安装时按当前用户桌面推导 | 时间线 Markdown 与附件目录（同级） |
 | `dataDir` | `<安装目录>\state\lan-chat` | 消息真相源（`.md` 由它原子重建） |
 | `maxFileMB` / `maxRequestMB` | `0` / `0`（不限） | 单文件 / 单请求上限（MB）。**写 0 = 不限** |
@@ -161,6 +161,31 @@ powershell -File install.ps1 -Uninstall           # 停服务、删任务、删�
 powershell -File install.ps1 -Uninstall -Force    # 连安装目录一起删
 ```
 
+### 6.1 git 推不动时的兜底推送（`scripts\push-via-api.mjs`）
+
+有些网络里 `git push` 会被中间设备掐断（`CONNECT tunnel failed, response 502`、TLS 握手被重置），
+但 `api.github.com` 仍然可达。这时用这个脚本走 GitHub Git Data API 把本地提交搬上去：
+
+```powershell
+$env:GH_TOKEN = '<有 contents:write 权限的 PAT>'
+node scripts\push-via-api.mjs --dry-run   # 先看会推什么，不在远端建任何对象
+node scripts\push-via-api.mjs             # 真推
+```
+
+它推的是**本地 HEAD 那个提交本身**：git 对象是内容寻址的，只要 parent / tree / message /
+author / committer 完全一致，远端算出来的 SHA 就和本地一模一样 —— 推完两边仍然同步，
+之后照常用 `git push`，不会分叉。
+
+几条刻意的约束：
+
+* 文件清单只取自 git 对象（`git ls-tree` / `git diff-tree`），所以未跟踪和被 `.gitignore`
+  忽略的文件（比如含口令的 `config\chat.config.json`）**不会**被传上去。
+* 每一步都比对 SHA（blob / tree / commit），任何一步对不上就在改 ref 之前中止；
+  远端最多留下几个未被引用的悬空对象。
+* 默认要求快进（远端必须正好在本地 HEAD 的父提交上），非快进直接报错；
+  确实要覆盖得显式加 `--force`。
+* token 只从环境变量 `GH_TOKEN` / `GITHUB_TOKEN` 读，绝不落盘。
+
 ---
 
 ## 7. 本机（旧机）切到这套包的可选步骤
@@ -197,7 +222,7 @@ powershell -File install.ps1 -Uninstall -Force    # 连安装目录一起删
 * 配对 token 只在本机回环内存里生成，门是唯一对外签发代理；门签出的链接 10 分钟过期，但门本身"每次打开现签"，所以永远新鲜。
 * lan-chat：单文件/单请求/解包总量/条目数上限（可由配置调整，`0` = 不限），文件名消毒，解包路径强制校验在 `assetsDir` 内，附件目录无索引，非图片强制 `attachment` 下载。
 * lan-chat 的大文件路径：上传流式落盘（不整份进内存），落盘前预检磁盘余量，下载走流式并支持 `Range` 续传；`server.requestTimeout` 已关闭，避免长传输被 Node 默认 300 秒掐断。临时分片在传输中断/崩溃后由下一次启动清理。
-* 已知取舍：明文 HTTP（局域网）；口令明文存在配置里（4 位数字属"够用就好"级；要更严就换长口令 + 收窄防火墙到单机 IP + 走 SSH 隧道）。
+* 已知取舍：明文 HTTP（局域网）；口令明文存在配置里。首次安装的口令是**随机生成的 8 位**，仓库里没有任何可用的默认口令（示例配置写的是占位符 `CHANGE-ME`）。要更严可以换更长口令 + 收窄防火墙到单机 IP + 走 SSH 隧道。
 
 ---
 
