@@ -124,10 +124,13 @@ function parsePerson(line) {
 /**
  * 把「本地 HEAD 那个提交」需要的一切读出来。
  * 只读 git 对象，不碰工作区，所以未提交的改动不会被推上去。
+ *
+ * runGit 可注入：默认就是上面那个 git()，测试时可以换成假的实现，
+ * 于是这段解析逻辑不必真的去跑 git 也能被验证。
  */
-export function collectFacts(root, branch = '') {
-  const head = git(['rev-parse', 'HEAD'], root).trim()
-  const raw = git(['cat-file', 'commit', head], root)
+export function collectFacts(root, branch = '', runGit = git) {
+  const head = runGit(['rev-parse', 'HEAD'], root).trim()
+  const raw = runGit(['cat-file', 'commit', head], root)
   const sep = raw.indexOf('\n\n')
   if (sep < 0) throw new Error('commit 对象格式异常')
 
@@ -145,12 +148,12 @@ export function collectFacts(root, branch = '') {
   const message = raw.slice(sep + 2) // 含结尾换行，原样保留
 
   // 文件清单只来自 git 对象：未跟踪 / 被忽略的文件不会出现
-  const changed = git(['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', head], root)
+  const changed = runGit(['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', head], root)
     .split('\0')
     .filter(Boolean)
 
   const treeEntries = new Map()
-  for (const line of git(['ls-tree', '-r', '-z', head], root).split('\0')) {
+  for (const line of runGit(['ls-tree', '-r', '-z', head], root).split('\0')) {
     if (!line) continue
     const m = /^(\d+)\s+(\w+)\s+([0-9a-f]+)\t([\s\S]*)$/.exec(line)
     if (m) treeEntries.set(m[4], { mode: m[1], type: m[2], sha: m[3] })
@@ -160,13 +163,13 @@ export function collectFacts(root, branch = '') {
   for (const path of changed) {
     const entry = treeEntries.get(path)
     if (!entry) throw new Error(`本地 tree 里找不到 ${path}`)
-    blobs.set(entry.sha, git(['cat-file', 'blob', entry.sha], root, true))
+    blobs.set(entry.sha, runGit(['cat-file', 'blob', entry.sha], root, true))
   }
 
-  const parentTree = parents.length > 0 ? git(['rev-parse', `${parents[0]}^{tree}`], root).trim() : null
-  const dirty = git(['status', '--porcelain'], root).trim()
+  const parentTree = parents.length > 0 ? runGit(['rev-parse', `${parents[0]}^{tree}`], root).trim() : null
+  const dirty = runGit(['status', '--porcelain'], root).trim()
 
-  const name = branch || git(['rev-parse', '--abbrev-ref', 'HEAD'], root).trim()
+  const name = branch || runGit(['rev-parse', '--abbrev-ref', 'HEAD'], root).trim()
 
   return { head, tree, parents, author, committer, message, changed, treeEntries, blobs, parentTree, dirty, branch: name }
 }
