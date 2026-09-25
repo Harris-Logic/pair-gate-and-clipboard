@@ -123,9 +123,15 @@ pair-gate-and-clipboard\
 | `password` | `0322` | 进入口令 |
 | `desktopMd` / `assetsDir` | 安装时按当前用户桌面推导 | 时间线 Markdown 与附件目录（同级） |
 | `dataDir` | `<安装目录>\state\lan-chat` | 消息真相源（`.md` 由它原子重建） |
-| `maxFileMB` / `maxRequestMB` | 100 / 200 | 单文件 / 单请求上限 |
-| `maxZipEntries` / `maxZipTotalMB` | 5000 / 500 | zip 炸弹防护 |
+| `maxFileMB` / `maxRequestMB` | `0` / `0`（不限） | 单文件 / 单请求上限（MB）。**写 0 = 不限** |
+| `maxZipEntries` / `maxZipTotalMB` | `0` / `0`（不限） | zip 炸弹防护。同样 0 = 不限 |
 | `mdOrder` | `newest-first` | 或 `oldest-first` |
+
+> 上限写成 `0`（或 `null` / `"unlimited"`）即该项不限。单文件与单次传输走**流式落盘**
+> （边收边写临时文件、完成后原子改名），所以"不限"不会撑爆内存，实际只受目标盘剩余空间约束；
+> 落盘前会预检磁盘余量，空间不够会立刻返回明确错误，而不是传到一半失败。
+> 唯一的例外是 zip（文件夹上传）：解包要整份读进内存，服务端硬阈值 1 GB，超过会提示改用
+> 「直接发文件」或分卷压缩后当普通文件发。
 
 环境变量可覆盖：`PAIR_GATE_CONFIG` `PAIR_GATE_DATA_DIR` `PAIR_GATE_PORT` `PAIR_GATE_WEB_PORT`
 `PAIR_GATE_ADDRESS` `PAIR_GATE_PASSWORD` / `LANCHAT_CONFIG` `LANCHAT_PORT` `LANCHAT_PASSWORD`。
@@ -189,7 +195,8 @@ powershell -File install.ps1 -Uninstall -Force    # 连安装目录一起删
 
 * 口令鉴权：浏览器 12 小时会话 cookie；脚本可用 HTTP Basic；失败按来源 IP 限速（15 分钟 5 次封 15 分钟）。日志**从不记口令**。
 * 配对 token 只在本机回环内存里生成，门是唯一对外签发代理；门签出的链接 10 分钟过期，但门本身"每次打开现签"，所以永远新鲜。
-* lan-chat：单文件/单请求/解包总量/条目数上限，文件名消毒，解包路径强制校验在 `assetsDir` 内，附件目录无索引，非图片强制 `attachment` 下载。
+* lan-chat：单文件/单请求/解包总量/条目数上限（可由配置调整，`0` = 不限），文件名消毒，解包路径强制校验在 `assetsDir` 内，附件目录无索引，非图片强制 `attachment` 下载。
+* lan-chat 的大文件路径：上传流式落盘（不整份进内存），落盘前预检磁盘余量，下载走流式并支持 `Range` 续传；`server.requestTimeout` 已关闭，避免长传输被 Node 默认 300 秒掐断。临时分片在传输中断/崩溃后由下一次启动清理。
 * 已知取舍：明文 HTTP（局域网）；口令明文存在配置里（4 位数字属"够用就好"级；要更严就换长口令 + 收窄防火墙到单机 IP + 走 SSH 隧道）。
 
 ---

@@ -28,6 +28,9 @@
  * 安全（因为会往桌面写文件，这几条是硬要求）
  *   * 口令鉴权（cookie 会话 + HTTP Basic），失败按 IP 限速封禁；
  *   * 单文件/单请求/解包总量/条目数上限，防塞满磁盘与 zip 炸弹；
+ *     这些上限都可由配置调；配成 0 即"不限"（见下方 limitMB/limitCount）；
+ *   * 上传走流式落盘（边收边写临时文件），所以"不限"不等于"爆内存"；
+ *     落盘前预检磁盘余量，传大文件时宁可立刻报错也不写满系统盘；
  *   * 文件名消毒 + 路径穿越校验，附件只落在 assets 目录内，拒绝覆盖已有文件；
  *   * 不提供目录索引，不执行任何上传内容；日志绝不记录口令。
  *
@@ -38,13 +41,19 @@ import { createServer } from 'node:http'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   appendFileSync,
+  closeSync,
+  createReadStream,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
+  statfsSync,
   statSync,
+  unlinkSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { basename, dirname, extname, join, resolve, sep } from 'node:path'
@@ -84,10 +93,43 @@ const MESSAGES_PATH = join(DATA_DIR, 'messages.jsonl')
 const ASSETS_REL = basename(ASSETS_DIR) // .md 中的相对引用前缀
 const MD_ORDER = CFG.mdOrder === 'oldest-first' ? 'oldest-first' : 'newest-first'
 
-const MAX_FILE = Number(CFG.maxFileMB ?? 100) * 1024 * 1024
-const MAX_REQUEST = Number(CFG.maxRequestMB ?? 200) * 1024 * 1024
-const MAX_ZIP_ENTRIES = Number(CFG.maxZipEntries ?? 5000)
-const MAX_ZIP_TOTAL = Number(CFG.maxZipTotalMB ?? 500) * 1024 * 1024
+/**
+ * 上限解析：配置里写 0 / 负数 / null / "unlimited" 一律表示**不限**（返回 Infinity）。
+ * 没写这个键才用默认值。所以"去掉限制"只是改配置，不必动代码。
+ */
+const UNLIMITED_RE = /^(0|unlimited|inf|infinity|none|off|no)$/i
+function limitMB(value, defaultMB) {
+  if (value === undefined || value === null) return defaultMB * 1048576
+  if (typeof value === 'string' && UNLIMITED_RE.test(value.trim())) return Infinity
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return Infinity
+  return n * 1048576
+}
+function limitCount(value, defaultCount) {
+  if (value === undefined || value === null) return defaultCount
+  if (typeof value === 'string' && UNLIMITED_RE.test(value.trim())) return Infinity
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return Infinity
+  return Math.floor(n)
+}
+
+const MAX_FILE = limitMB(CFG.maxFileMB, 100)
+const MAX_REQUEST = limitMB(CFG.maxRequestMB, 200)
+const MAX_ZIP_ENTRIES = limitCount(CFG.maxZipEntries, 5000)
+const MAX_ZIP_TOTAL = limitMB(CFG.maxZipTotalMB, 500)
+/**
+ * zip 解包要在内存里整份读入（inflateRawSync 无法流式），Buffer 上限约 2 GiB。
+ * 所以"文件夹"这条路上限不能真的是无限：超过阈值就给出可操作的提示，
+ * 让用户改走"直接发文件"（那条路是真流式、不限大小）。
+ */
+const MAX_ZIP_BUFFER = 1024 * 1024 * 1024
+/** 落盘前预检磁盘余量，留出的安全边距（避免刚好写满系统盘）。 */
+const DISK_MARGIN = 512 * 1024 * 1024
+/** 未完成的临时分片前缀（放在 assets 内，保证与最终文件同卷，rename 才是原子的）。 */
+const PART_PREFIX = '.lanchat-part-'
+
+/** 人类可读的上限描述；不限时返回"不限"。 */
+const humanLimit = (bytes) => (Number.isFinite(bytes) ? humanSize(bytes) : '不限')
 
 const COOKIE = 'lanchat'
 const COOKIE_MAX_AGE = 12 * 3600
@@ -97,6 +139,17 @@ const FAIL_MAX = 5
 const FAIL_BLOCK = 15 * 60_000
 
 for (const dir of [DATA_DIR, ASSETS_DIR]) mkdirSync(dir, { recursive: true })
+
+// 上次崩溃 / 传输中断可能留下半截临时分片，启动时清掉，别让它堆在桌面。
+try {
+  for (const name of readdirSync(ASSETS_DIR)) {
+    if (name.startsWith(PART_PREFIX)) {
+      try {
+        unlinkSync(join(ASSETS_DIR, name))
+      } catch {}
+    }
+  }
+} catch {}
 
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`)
 const localUrls = () =>
@@ -409,6 +462,143 @@ function readBody(req, limit) {
 }
 
 // ---------------------------------------------------------------------------
+// 流式 multipart/form-data 解析
+//
+// 为什么不用 readBody(req) + new Response(buf).formData()：
+//   那条路要把整个请求体、解析结果、以及每个文件的 arrayBuffer 在内存里复制
+//   2~3 份；200 MB 的请求就要几百 MB 堆，单文件上百 MB 必然 OOM ——
+//   这正是原来"单文件 100 MB / 单次 200 MB"限制的技术根源。
+//   这里改成边收边落盘：文件字节直接 write 进临时文件，内存里只留很小的字段。
+// ---------------------------------------------------------------------------
+
+/** 从 content-type 里取 multipart 边界。 */
+function boundaryOf(contentType) {
+  const m = /;\s*boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType ?? ''))
+  const b = m?.[1] ?? m?.[2]
+  return b && b.length <= 200 ? b : undefined
+}
+
+/**
+ * 极简流式 multipart 解析器（零依赖）。
+ * 只在内存里保留"可能承载边界的一小段尾巴"，其余字节立刻交给 onPartData。
+ */
+function createMultipartParser(boundary, handlers) {
+  const B = Buffer.from(`--${boundary}`)
+  const DASHB = Buffer.from(`\r\n--${boundary}`)
+  let pending = Buffer.alloc(0)
+  let state = 'preamble' // preamble → afterBoundary → headers → body → done
+  let part = null
+  let headerRaw = ''
+
+  const startPart = (raw) => {
+    const headers = {}
+    for (const line of raw.split('\r\n')) {
+      const i = line.indexOf(':')
+      if (i < 0) continue
+      headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim()
+    }
+    const disp = {}
+    for (const m of String(headers['content-disposition'] ?? '').matchAll(/([A-Za-z-]+)="([^"]*)"/g)) {
+      disp[m[1].toLowerCase()] = m[2]
+    }
+    part = {
+      name: disp.name ?? '',
+      filename: disp.filename, // undefined → 普通文本字段
+      contentType: headers['content-type'] ?? '',
+    }
+    handlers.onPartStart?.(part)
+  }
+
+  function step() {
+    for (;;) {
+      if (state === 'preamble') {
+        const i = pending.indexOf(B)
+        if (i < 0) {
+          if (pending.length > B.length + 4) pending = pending.subarray(pending.length - (B.length + 4))
+          return
+        }
+        pending = pending.subarray(i + B.length)
+        state = 'afterBoundary'
+        continue
+      }
+      if (state === 'afterBoundary') {
+        if (pending.length < 2) return
+        if (pending[0] === 0x2d && pending[1] === 0x2d) {
+          state = 'done' // "--" → 结束边界
+          pending = Buffer.alloc(0)
+          return
+        }
+        if (pending[0] === 0x0d && pending[1] === 0x0a) pending = pending.subarray(2)
+        state = 'headers'
+        headerRaw = ''
+        continue
+      }
+      if (state === 'headers') {
+        const i = pending.indexOf('\r\n\r\n')
+        if (i < 0) {
+          if (pending.length > 256 * 1024) throw new Error('multipart 头部异常大')
+          return
+        }
+        headerRaw += pending.subarray(0, i).toString('utf8')
+        pending = pending.subarray(i + 4)
+        startPart(headerRaw)
+        state = 'body'
+        continue
+      }
+      if (state === 'body') {
+        const i = pending.indexOf(DASHB)
+        if (i < 0) {
+          // 尾巴里可能藏着跨块的边界，留够 DASHB.length - 1 字节继续攒
+          const keep = DASHB.length - 1
+          if (pending.length > keep) {
+            handlers.onPartData?.(part, pending.subarray(0, pending.length - keep))
+            pending = pending.subarray(pending.length - keep)
+          }
+          return
+        }
+        if (i > 0) handlers.onPartData?.(part, pending.subarray(0, i))
+        handlers.onPartEnd?.(part)
+        part = null
+        pending = pending.subarray(i + DASHB.length)
+        state = 'afterBoundary'
+        continue
+      }
+      pending = Buffer.alloc(0) // done：丢掉 epilogue
+      return
+    }
+  }
+
+  return {
+    write(chunk) {
+      if (state === 'done') return
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk])
+      step()
+    },
+    end() {
+      step()
+      if (state !== 'done' && part) {
+        // 结束边界缺失（客户端中断）：把残留交出去，由上层判定为失败
+        if (pending.length > 0) handlers.onPartData?.(part, pending)
+        handlers.onPartEnd?.(part)
+        part = null
+      }
+      state = 'done'
+      pending = Buffer.alloc(0)
+    },
+  }
+}
+
+/** 目标目录所在卷的可用字节数（拿不到就返回 undefined，不阻断上传）。 */
+function freeBytesOf(dir) {
+  try {
+    const st = statfsSync(dir)
+    return Number(st.bavail) * Number(st.bsize)
+  } catch {
+    return undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 页面
 // ---------------------------------------------------------------------------
 
@@ -591,9 +781,11 @@ const server = createServer(async (req, res) => {
       urls: localUrls(),
       port: PORT,
       limits: {
-        maxFileMB: MAX_FILE / 1048576,
-        maxRequestMB: MAX_REQUEST / 1048576,
-        maxZipEntries: MAX_ZIP_ENTRIES,
+        // null = 不限（前端据此显示"不限"）
+        maxFileMB: Number.isFinite(MAX_FILE) ? MAX_FILE / 1048576 : null,
+        maxRequestMB: Number.isFinite(MAX_REQUEST) ? MAX_REQUEST / 1048576 : null,
+        maxZipEntries: Number.isFinite(MAX_ZIP_ENTRIES) ? MAX_ZIP_ENTRIES : null,
+        maxZipTotalMB: Number.isFinite(MAX_ZIP_TOTAL) ? MAX_ZIP_TOTAL / 1048576 : null,
       },
       mdPath: MD_PATH,
       assetsRel: ASSETS_REL,
@@ -628,61 +820,193 @@ const server = createServer(async (req, res) => {
   }
 
   if (path === '/send' && req.method === 'POST') {
-    let form
-    try {
-      const buf = await readBody(req, MAX_REQUEST)
-      form = await new Response(buf, { headers: { 'content-type': req.headers['content-type'] ?? '' } }).formData()
-    } catch (error) {
-      json(res, 400, { ok: false, error: `无法解析请求：${error.message}` })
+    const boundary = boundaryOf(req.headers['content-type'])
+    if (boundary === undefined) {
+      json(res, 400, { ok: false, error: '缺少 multipart 边界（content-type 不对）' })
       return
     }
-    const text = String(form.get('text') ?? '').trim()
-    const device = safeName(String(form.get('device') ?? '') || deviceNameFromUa(ua), '未命名设备')
-    const files = []
-    const ts = Date.now()
-    const base = `${stamp()}-${randomBytes(2).toString('hex')}`
-    let seq = 0
 
-    const takeFile = async (file, kind) => {
-      const bytes = Buffer.from(await file.arrayBuffer())
-      seq += 1
-      if (bytes.length > MAX_FILE) throw new Error(`单个文件超过 ${MAX_FILE / 1048576} MB：${file.name}`)
-      const original = safeName(file.name, kind === 'zip' ? 'archive.zip' : 'file')
-      if (kind === 'zip') {
-        const folderName = uniqueInAssets(original.replace(/\.zip$/i, '') || `目录-${base}-${seq}`)
-        const entries = unpackZip(bytes, folderName)
-        return { name: original.replace(/\.zip$/i, ''), stored: folderName, size: bytes.length, kind: 'folder', entries }
-      }
-      const stored = uniqueInAssets(`${base}-${seq}-${original}`)
-      writeFileSync(join(ASSETS_DIR, stored), bytes)
-      const ext = extname(stored).toLowerCase()
-      const kindOf = MIME_IMAGE[ext] ? 'image' : 'file'
-      return { name: original, stored, size: bytes.length, kind: kindOf }
-    }
-
-    try {
-      for (const file of form.getAll('files')) {
-        if (typeof file === 'string') continue
-        if (file.size > 0) files.push(await takeFile(file, 'file'))
-      }
-      for (const file of form.getAll('zip')) {
-        if (typeof file === 'string') continue
-        if (file.size > 0) files.push(await takeFile(file, 'zip'))
-      }
-      if (text === '' && files.length === 0) {
-        json(res, 400, { ok: false, error: '内容为空' })
+    // 磁盘余量预检：宁可立刻报错，也不要传到一半把系统盘写满。
+    const declared = Number(req.headers['content-length'] ?? 0)
+    if (Number.isFinite(declared) && declared > 0) {
+      const free = freeBytesOf(ASSETS_DIR)
+      if (free !== undefined && declared + DISK_MARGIN > free) {
+        json(res, 400, {
+          ok: false,
+          error: `磁盘空间不足：本次 ${humanSize(declared)}，目标盘可用 ${humanSize(free)}`,
+        })
         return
       }
-      const record = { id: `m-${ts}-${randomBytes(3).toString('hex')}`, ts, device, text, files }
-      appendMessage(record)
-      rebuildMarkdown(loadMessages())
-      broadcast(record)
-      log(`recv ${files.length} 个附件 / ${text.length} 字 · ${device}`)
-      json(res, 200, { ok: true, message: record })
-    } catch (error) {
-      log(`send 失败：${error.message}`)
-      json(res, 400, { ok: false, error: error.message })
     }
+
+    const ts = Date.now()
+    const base = `${stamp()}-${randomBytes(2).toString('hex')}`
+    const files = []
+    const fieldChunks = new Map()
+    let fieldBytes = 0
+    let received = 0
+    let seq = 0
+    let failure = null
+    let open = null // { tmpPath, fd, size }
+
+    /** 关闭当前分片；keep=false 时连临时文件一起删掉。 */
+    const closeOpen = (keep) => {
+      if (!open) return
+      const { fd, tmpPath } = open
+      open = null
+      try {
+        closeSync(fd)
+      } catch {}
+      if (!keep) {
+        try {
+          unlinkSync(tmpPath)
+        } catch {}
+      }
+    }
+
+    /** 出错即回响应并掐断连接，避免客户端继续把几个 GB 灌进来。 */
+    const abort = (error) => {
+      if (failure) return
+      failure = error
+      closeOpen(false)
+      try {
+        json(res, 400, { ok: false, error: error.message })
+      } catch {}
+      res.on('finish', () => {
+        try {
+          req.destroy()
+        } catch {}
+      })
+      if (res.writableFinished) {
+        try {
+          req.destroy()
+        } catch {}
+      }
+    }
+
+    // 连接断掉时别留下半截临时文件
+    res.on('close', () => closeOpen(false))
+
+    const parser = createMultipartParser(boundary, {
+      onPartStart(p) {
+        if (failure || p.filename === undefined) return
+        const tmpPath = join(ASSETS_DIR, `${PART_PREFIX}${randomBytes(6).toString('hex')}`)
+        try {
+          open = { tmpPath, fd: openSync(tmpPath, 'w'), size: 0 }
+        } catch (error) {
+          abort(new Error(`无法创建临时文件：${error.message}`))
+        }
+      },
+      onPartData(p, chunk) {
+        if (failure || chunk.length === 0) return
+        if (p.filename === undefined) {
+          fieldBytes += chunk.length
+          if (fieldBytes > 4 * 1024 * 1024) {
+            abort(new Error('表单字段过大'))
+            return
+          }
+          const arr = fieldChunks.get(p.name) ?? []
+          arr.push(Buffer.from(chunk)) // 复制：chunk 只是内部缓冲的视图
+          fieldChunks.set(p.name, arr)
+          return
+        }
+        if (!open) return
+        open.size += chunk.length
+        if (open.size > MAX_FILE) {
+          abort(new Error(`单个文件超过 ${humanLimit(MAX_FILE)}：${p.filename}`))
+          return
+        }
+        try {
+          writeSync(open.fd, chunk)
+        } catch (error) {
+          abort(new Error(`写入失败（磁盘可能已满）：${error.message}`))
+        }
+      },
+      onPartEnd(p) {
+        if (p.filename === undefined || !open) return
+        const { tmpPath, size } = open
+        closeOpen(true) // 关 fd，保留临时文件
+        if (failure) {
+          try {
+            unlinkSync(tmpPath)
+          } catch {}
+          return
+        }
+        seq += 1
+        const original = safeName(p.filename, p.name === 'zip' ? 'archive.zip' : 'file')
+        let moved = false
+        try {
+          if (p.name === 'zip') {
+            if (size > MAX_ZIP_BUFFER) {
+              throw new Error(
+                `zip 有 ${humanSize(size)}，服务端解包需整份读入内存（上限 ${humanSize(MAX_ZIP_BUFFER)}）：` +
+                  '请直接发送文件（单文件已不限大小），或分卷压缩后当普通文件发送。',
+              )
+            }
+            const folderName = uniqueInAssets(original.replace(/\.zip$/i, '') || `目录-${base}-${seq}`)
+            const entries = unpackZip(readFileSync(tmpPath), folderName)
+            files.push({ name: original.replace(/\.zip$/i, ''), stored: folderName, size, kind: 'folder', entries })
+          } else {
+            const stored = uniqueInAssets(`${base}-${seq}-${original}`)
+            renameSync(tmpPath, join(ASSETS_DIR, stored)) // 同卷改名，原子生效
+            moved = true
+            const ext = extname(stored).toLowerCase()
+            files.push({ name: original, stored, size, kind: MIME_IMAGE[ext] ? 'image' : 'file' })
+          }
+        } catch (error) {
+          abort(error)
+        } finally {
+          if (!moved) {
+            try {
+              unlinkSync(tmpPath)
+            } catch {}
+          }
+        }
+      },
+    })
+
+    try {
+      await new Promise((resolvePromise, reject) => {
+        req.on('data', (chunk) => {
+          if (failure) return
+          received += chunk.length
+          if (received > MAX_REQUEST) {
+            abort(new Error(`单次请求超过 ${humanLimit(MAX_REQUEST)}`))
+            return
+          }
+          try {
+            parser.write(chunk)
+          } catch (error) {
+            abort(error)
+          }
+        })
+        req.on('end', resolvePromise)
+        req.on('error', reject)
+        req.on('aborted', () => reject(new Error('客户端中断')))
+      })
+      parser.end()
+    } catch (error) {
+      abort(error)
+    }
+
+    if (failure) {
+      log(`send 失败：${failure.message}`)
+      return // abort() 里已经回过响应了
+    }
+
+    const text = Buffer.concat(fieldChunks.get('text') ?? []).toString('utf8').trim()
+    const deviceField = Buffer.concat(fieldChunks.get('device') ?? []).toString('utf8')
+    const device = safeName(deviceField || deviceNameFromUa(ua), '未命名设备')
+    if (text === '' && files.length === 0) {
+      json(res, 400, { ok: false, error: '内容为空' })
+      return
+    }
+    const record = { id: `m-${ts}-${randomBytes(3).toString('hex')}`, ts, device, text, files }
+    appendMessage(record)
+    rebuildMarkdown(loadMessages())
+    broadcast(record)
+    log(`recv ${files.length} 个附件 / ${text.length} 字 · ${device} · ${humanSize(received)}`)
+    json(res, 200, { ok: true, message: record })
     return
   }
 
@@ -711,16 +1035,51 @@ const server = createServer(async (req, res) => {
     }
     const ext = extname(target).toLowerCase()
     const image = MIME_IMAGE[ext]
-    res.writeHead(200, {
+    const total = stat.size
+    // 必须流式发送：readFileSync 会把整份文件读进内存，大文件直接 OOM。
+    // 同时支持 Range，大文件下载中断后可以续传。
+    let start = 0
+    let end = total - 1
+    let code = 200
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? '').trim())
+    if (range && (range[1] !== '' || range[2] !== '')) {
+      if (range[1] !== '') {
+        start = Number(range[1])
+        end = range[2] !== '' ? Number(range[2]) : total - 1
+      } else {
+        start = Math.max(0, total - Number(range[2]))
+        end = total - 1
+      }
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+        res.writeHead(416, { 'content-range': `bytes */${total}`, 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
+      end = Math.min(end, total - 1)
+      code = 206
+    }
+    res.writeHead(code, {
       'content-type': image ?? 'application/octet-stream',
-      'content-length': stat.size,
+      'content-length': end - start + 1,
+      'accept-ranges': 'bytes',
       'cache-control': 'private, max-age=300',
       'x-content-type-options': 'nosniff',
       ...(image
         ? {}
         : { 'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(basename(target))}` }),
+      ...(code === 206 ? { 'content-range': `bytes ${start}-${end}/${total}` } : {}),
     })
-    res.end(readFileSync(target))
+    if (req.method === 'HEAD') {
+      res.end()
+      return
+    }
+    const stream = createReadStream(target, { start, end })
+    stream.on('error', () => {
+      try {
+        res.destroy()
+      } catch {}
+    })
+    stream.pipe(res)
     return
   }
 
@@ -752,6 +1111,15 @@ const server = createServer(async (req, res) => {
   res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
   res.end('not found\n')
 })
+
+/**
+ * Node 18+ 默认 requestTimeout = 300s，指的是"收完整个请求"的时限。
+ * 大文件在 WiFi 上传几分钟到几十分钟很常见，不关掉就会传到一半被掐断 ——
+ * 这是"大文件传不完"的隐藏原因，和体积上限无关，但同样致命。
+ */
+server.requestTimeout = 0
+server.headersTimeout = 60_000
+server.keepAliveTimeout = 5_000
 
 function deviceNameFromUa(ua) {
   if (/Android/i.test(ua)) return 'Android 设备'

@@ -171,8 +171,10 @@ async function boot() {
   try {
     const cfg = await (await fetch('/config')).json()
     document.getElementById('urls').textContent = '本机入口：' + (cfg.urls || []).join('  ')
+    const lim = cfg.limits || {}
+    const showLimit = (v) => (v === null || v === undefined ? '不限' : v + ' MB')
     document.getElementById('hint').textContent =
-      '上限：单文件 ' + cfg.limits.maxFileMB + ' MB / 单次 ' + cfg.limits.maxRequestMB + ' MB · 文件夹请先压成 zip 再发'
+      '上限：单文件 ' + showLimit(lim.maxFileMB) + ' / 单次 ' + showLimit(lim.maxRequestMB) + ' · 文件夹请先压成 zip 再发'
     if (device === '') {
       device = 'Android 设备'
       deviceEl.value = device
