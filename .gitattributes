@@ -1,0 +1,12 @@
+# 统一换行：文本入库用 LF，检出时 Windows 用 CRLF。
+# PS 脚本带 UTF-8 BOM（PS 5.1 读中文需要），.mjs/.html/.json 必须无 BOM，
+# 所以这里只固定换行策略，不做编码转换。
+* text=auto eol=crlf
+
+*.ps1 text eol=crlf
+*.mjs text eol=crlf
+*.html text eol=crlf
+*.md text eol=crlf
+*.json text eol=crlf
+.gitignore text eol=crlf
+LICENSE text eol=crlf
