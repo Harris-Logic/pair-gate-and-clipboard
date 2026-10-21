@@ -10,3 +10,26 @@ config/chat.config.json
 # 本机临时物
 *.bak
 *.log
+
+# >>> ghsync (managed) >>>
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+coverage/
+.cache/
+.idea/
+.vscode/settings.json
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+# <<< ghsync (managed) <<<
